@@ -1,207 +1,306 @@
 #!/usr/bin/env python3
-"""
-corewar_marble_particles_safe.py
-Visualise un log Corewar sous forme de course de billes.
+"""corewar_marble_refactored
 
-Contrôles :
-    W A S D / Q E  → déplacer la caméra
-    ⇧ Shift        → sprinter la caméra
-    P              → doubler la cadence du replay
-    O              → diviser la cadence par 2
+A tidy, PEP‑8–compliant re‑write of *Corewar Marble*: a tiny Panda3D visualiser that
+turns a Corewar execution log into a cute marble race.
+
+Run with the path to your log file::
+
+    python corewar_marble_refactored.py my_run.log
+
+The log must contain lines such as::
+
+    The player 1(foobar) is alive.
+    The player 3(baz) has won.
+
+Every *alive* line moves the corresponding marble forward; the *win* line paints
+it gold and stops the replay.
 """
 
 from __future__ import annotations
-import sys, re
+
+import sys
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List
 
-from direct.showbase.ShowBase import ShowBase            # type: ignore
-from direct.task import Task                             # type: ignore
-from direct.particles.ParticleEffect import ParticleEffect  # type: ignore
-from panda3d.core import (                               # type: ignore
-    AmbientLight, CardMaker, DirectionalLight,
-    TextNode, Vec3, Vec4, WindowProperties,
+from direct.showbase.ShowBase import ShowBase  # type: ignore
+from direct.task import Task                   # type: ignore
+from panda3d.core import (                     # type: ignore
+    AmbientLight,
+    CardMaker,
+    DirectionalLight,
+    TextNode,
+    Vec3,
+    Vec4,
+    WindowProperties,
 )
 
-# ─── Configuration ────────────────────────────────────────────────────
-LINE_DT    = 0.4
-STEP_DIST  = 4.0
-SPEED      = STEP_DIST / LINE_DT
+# ---------------------------------------------------------------------------
+# Configuration ‑‑ tweak at will ✨
+# ---------------------------------------------------------------------------
 
-FLOOR_HALF = 1_000
-START_Y    = 0
-LANES_X    = [-15, -5, 5, 15]
+LINE_TIME: float      = 0.4        # seconds per log line
+STEP_DIST: float      = 4.0        # units advanced per *alive* ping
+SPEED: float          = STEP_DIST / LINE_TIME  # auto‑derived marble speed
 
-CAM_BACK   = 60
-CAM_HGT    = 35
-FLY_VEL    = 30
-SPRINTx2   = 2
-SENS       = 0.16
+FLOOR_HALF: int       = 1_000      # half‑size of the grey floor (→ 2000×2000)
+START_Y: int          = 0          # Y coordinate of the starting line
+LANES_X: List[int]    = [-15, -5, 5, 15]  # 4 starting X positions for marbles
 
-T_MIN, T_MAX = 0.05, 2.0   # bornes pour P/O
+CAMERA_OFFSET: int    = 60         # camera sits 60 units behind the start
+CAMERA_HEIGHT: int    = 35         # …and 35 units above the ground
+
+FLY_SPEED: float      = 30         # normal free‑cam speed
+SPRINT_FACTOR: int    = 2          # hold ⇧Shift to double that speed
+
+MOUSE_SENSITIVITY: float = 0.16    # degrees per pixel
+
+# ---------------------------------------------------------------------------
+# Compiled regexen 🕵️‍♀️
+# ---------------------------------------------------------------------------
 
 R_ALIVE = re.compile(r"The player \d+\(([^)]+)\) is alive\.")
 R_WIN   = re.compile(r"The player \d+\(([^)]+)\) has won\.")
 
-# ─── Dataclass Player ────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Player:
-    model: "NodePath"
-    label: "NodePath"
-    travelled: float = 0.0
-    target: float    = 0.0
-    winner: bool     = False
-    def move(self, d: float) -> None:
-        self.travelled += d
-        self.model.set_y(self.model, d)
+    """All the scene graph nodes that belong to a marble + its state."""
 
-# ─── Application class ───────────────────────────────────────────────
+    model: "NodePath"  # the marble mesh
+    label: "NodePath"  # billboarded text above the marble
+    travelled: float = 0.0  # how far we have actually moved (Z)
+    target: float    = 0.0  # how far we *should* be after the last tick
+
+    def move(self, delta: float) -> None:
+        """Move the marble *delta* units forward on Y."""
+        self.travelled += delta
+        self.model.set_y(self.model, delta)  # local‑axis move
+
+# ---------------------------------------------------------------------------
+# Main application 🍿
+# ---------------------------------------------------------------------------
+
 class CorewarMarble(ShowBase):
-    def __init__(self, log_lines: Iterable[str]) -> None:
+    """Panda3D application driving the marble animation."""
+
+    _players: Dict[str, Player]
+    _next_lane: int
+    _log_lines: Iterator[str]
+
+    def __init__(self, lines: Iterable[str]) -> None:  # noqa: D401
         super().__init__()
 
-        # Window + mouse
-        wp = WindowProperties(); wp.setCursorHidden(True)
-        self.win.requestProperties(wp); self.disableMouse()
-        self.h = self.p = 0.0
-        self.cx, self.cy = self.win.getXSize()//2, self.win.getYSize()//2
-        self.camera.set_pos(0, START_Y - CAM_BACK, CAM_HGT)
-        self.camera.look_at(0, START_Y, 0)
-        self.win.movePointer(0, self.cx, self.cy)
+        # -- Window & free‑cam set‑up --------------------------------------
+        props = WindowProperties()
+        props.setCursorHidden(True)
+        self.win.requestProperties(props)
+        self.disableMouse()
 
-        # Keymap
-        self.keys = {k: False for k in "wasdqe"} | {"shift": False}
-        for k in self.keys:
-            self.accept(k,        self._set_key, [k, True])
-            self.accept(f"{k}-up", self._set_key, [k, False])
-        self.accept("p", self._faster)
-        self.accept("o", self._slower)
+        self._init_camera()
+        self._bind_keys()
+
+        # -- Scene: grey floor + lights ------------------------------------
+        self._build_floor()
+        self._setup_lighting()
+
+        # -- State ----------------------------------------------------------
+        self._players = {}
+        self._next_lane = 0
+        self._log_lines = self._clean(lines)
+
+        # -- Task chain -----------------------------------------------------
+        self.task_mgr.add(self._update_mouse, "🌈 mouse‑look")
+        self.task_mgr.add(self._update_movement, "🚀 free‑cam‑move")
+        self.task_mgr.add(self._lerp_marbles, "🐣 smooth‑marble‑motion")
+        self.task_mgr.doMethodLater(LINE_TIME, self._tick_log, "📜 replay‑log")
+
+    # ------------------------------------------------------------------
+    # 🌟  Camera helpers
+    # ------------------------------------------------------------------
+
+    def _init_camera(self) -> None:
+        """Position the free camera at the initial vantage point."""
+        self.camera.set_pos(0, START_Y - CAMERA_OFFSET, CAMERA_HEIGHT)
+        self.camera.look_at(0, START_Y, 0)
+
+        self._heading: float = 0.0
+        self._pitch: float = 0.0
+
+        # store centre of the window for cursor warping
+        self._cx = self.win.get_x_size() // 2
+        self._cy = self.win.get_y_size() // 2
+        self.win.movePointer(0, self._cx, self._cy)
+
+    # Key‑handling -------------------------------------------------------
+
+    def _bind_keys(self) -> None:
+        self._keys = {k: False for k in "wasdqe"} | {"shift": False}
+
+        for key in self._keys:
+            self.accept(key,       self._set_key, [key, True])
+            self.accept(f"{key}-up", self._set_key, [key, False])
         self.accept("escape", sys.exit)
 
-        # Floor
+    def _set_key(self, key: str, state: bool) -> None:
+        self._keys[key] = state
+
+    # Mouse‑look ---------------------------------------------------------
+
+    def _update_mouse(self, task: Task) -> Task:
+        md = self.win.getPointer(0)
+        dx = md.get_x() - self._cx
+        dy = md.get_y() - self._cy
+
+        self._heading -= dx * MOUSE_SENSITIVITY
+        self._pitch = max(-90, min(90, self._pitch - dy * MOUSE_SENSITIVITY))
+
+        self.camera.set_hpr(self._heading, self._pitch, 0)
+        self.win.movePointer(0, self._cx, self._cy)
+        return Task.cont
+
+    # Keyboard movement --------------------------------------------------
+
+    def _update_movement(self, task: Task) -> Task:
+        dt = globalClock.getDt()
+        direction = Vec3(0)
+        q = self.camera.getQuat()
+
+        if self._keys["w"]:
+            direction += q.getForward()
+        if self._keys["s"]:
+            direction -= q.getForward()
+        if self._keys["a"]:
+            direction -= q.getRight()
+        if self._keys["d"]:
+            direction += q.getRight()
+        if self._keys["q"]:
+            direction += q.getUp()
+        if self._keys["e"]:
+            direction -= q.getUp()
+
+        if direction.length_squared() > 0:
+            speed = FLY_SPEED * (SPRINT_FACTOR if self._keys["shift"] else 1)
+            self.camera.set_pos(self.camera.get_pos() + direction.normalized() * speed * dt)
+        return Task.cont
+
+    # ------------------------------------------------------------------
+    # 🌟  Scene helpers
+    # ------------------------------------------------------------------
+
+    def _build_floor(self) -> None:
         cm = CardMaker("floor")
         cm.setFrame(-FLOOR_HALF, FLOOR_HALF, -FLOOR_HALF, FLOOR_HALF)
-        floor = self.render.attachNewNode(cm.generate())
-        floor.set_p(-90)
-        floor.set_color(0.5, 0.5, 0.5, 1)
-        floor.set_two_sided(True)
+        floor_np = self.render.attachNewNode(cm.generate())
+        floor_np.set_p(-90)
+        floor_np.set_color(0.5, 0.5, 0.5, 1)
+        floor_np.set_two_sided(True)
 
-        # Lights
-        amb = AmbientLight("amb");   amb.setColor(Vec4(0.45, 0.45, 0.45, 1))
-        sun = DirectionalLight("sun"); sun.setDirection(Vec3(-1, -1, -2))
-        sun.setColor(Vec4(0.9, 0.9, 0.9, 1))
-        self.render.set_light(self.render.attachNewNode(amb))
+    def _setup_lighting(self) -> None:
+        ambient = AmbientLight("ambient")
+        ambient.set_color(Vec4(0.45, 0.45, 0.45, 1))
+        sun = DirectionalLight("sun")
+        sun.set_color(Vec4(0.9, 0.9, 0.9, 1))
+        self.render.set_light(self.render.attachNewNode(ambient))
         self.render.set_light(self.render.attachNewNode(sun))
 
-        # State
-        self.players: Dict[str, Player] = {}
-        self.next_lane = 0
-        self.lines: Iterator[str] = (l.strip() for l in log_lines if l.strip())
-        self.tick_dt = LINE_DT
+    # ------------------------------------------------------------------
+    # 🌟  Marble helpers
+    # ------------------------------------------------------------------
 
-        # Tasks
-        self.task_mgr.add(self._mouse_look, "mouse")
-        self.task_mgr.add(self._free_move,  "move")
-        self.task_mgr.add(self._lerp,       "lerp")
-        self._schedule_tick()
-
-    # ── Input helpers ────────────────────────────────────────────────
-    def _set_key(self, k: str, v: bool) -> None: self.keys[k] = v
-
-    def _mouse_look(self, t: Task) -> Task:
-        md = self.win.getPointer(0)
-        dx, dy = md.get_x() - self.cx, md.get_y() - self.cy
-        self.h -= dx * SENS
-        self.p = max(-90, min(90, self.p - dy * SENS))
-        self.camera.set_hpr(self.h, self.p, 0)
-        self.win.movePointer(0, self.cx, self.cy)
-        return Task.cont
-
-    def _free_move(self, t: Task) -> Task:
-        dt, vec = globalClock.getDt(), Vec3(0)
-        q = self.camera.getQuat()
-        if self.keys["w"]: vec += q.getForward()
-        if self.keys["s"]: vec -= q.getForward()
-        if self.keys["a"]: vec -= q.getRight()
-        if self.keys["d"]: vec += q.getRight()
-        if self.keys["q"]: vec += q.getUp()
-        if self.keys["e"]: vec -= q.getUp()
-        if vec.length_squared():
-            speed = FLY_VEL * (SPRINTx2 if self.keys["shift"] else 1)
-            self.camera.set_pos(self.camera.get_pos() + vec.normalized()*speed*dt)
-        return Task.cont
-
-    # ── Marble logic ────────────────────────────────────────────────
     def _ensure_player(self, name: str) -> Player:
-        if name in self.players:
-            return self.players[name]
-        lane_x = LANES_X[self.next_lane % len(LANES_X)]
-        self.next_lane += 1
-        ball = self.loader.loadModel("models/smiley")
-        ball.set_scale(1); ball.set_pos(lane_x, START_Y, 1.5); ball.reparent_to(self.render)
-        tn = TextNode(name); tn.setText(name); tn.setAlign(TextNode.ACenter)
-        label = ball.attachNewNode(tn); label.set_scale(.8); label.set_pos(0,0,1.8); label.set_billboard_axis()
-        pl = Player(ball, label); self.players[name] = pl; return pl
+        """Return the *Player* instance, creating its visual nodes if needed."""
+        if name in self._players:
+            return self._players[name]
 
-    def _lerp(self, t: Task) -> Task:
-        dt, step = globalClock.getDt(), SPEED*globalClock.getDt()
-        for pl in self.players.values():
-            if not pl.winner and pl.travelled < pl.target:
-                pl.move(min(step, pl.target - pl.travelled))
+        lane_x = LANES_X[self._next_lane % len(LANES_X)]
+        self._next_lane += 1
+
+        # --- model ------------------------------------------------------
+        ball = self.loader.loadModel("models/smiley")
+        ball.set_scale(1.0)
+        ball.set_pos(lane_x, START_Y, 1.5)
+        ball.reparent_to(self.render)
+
+        # --- name label --------------------------------------------------
+        tn = TextNode(f"label‑{name}")
+        tn.setText(name)
+        tn.setAlign(TextNode.ACenter)
+        label_np = ball.attachNewNode(tn)
+        label_np.set_scale(0.8)
+        label_np.set_pos(0, 0, 1.8)
+        label_np.set_billboard_axis()
+
+        player = Player(model=ball, label=label_np)
+        self._players[name] = player
+        return player
+
+    # Smooth interpolation ---------------------------------------------
+
+    def _lerp_marbles(self, task: Task) -> Task:
+        dt = globalClock.getDt()
+        step = SPEED * dt
+        for player in self._players.values():
+            if player.travelled < player.target:
+                remaining = player.target - player.travelled
+                player.move(min(step, remaining))
         return Task.cont
 
-    # ── Particles (safe) ─────────────────────────────────────────────
-    def _sparkle(self, pl: Player) -> None:
-        fx = ParticleEffect()
-        for preset in ("models/particles/sparkles.ptf",
-                       "models/particles/sparkle.ptf",
-                       "models/particles/firework.ptf"):
-            try:
-                fx.loadConfig(preset)
-                fx.start(parent=pl.model, renderParent=self.render)
-                return
-            except OSError:
-                continue
-        print("⚠️  Pas de preset de particules trouvé ; bille simplement dorée.")
-
-    # ── Log processing ──────────────────────────────────────────────
-    def _schedule_tick(self) -> None:
-        self.task_mgr.doMethodLater(self.tick_dt, self._tick_log, "log")
+    # ------------------------------------------------------------------
+    # 🌟  Log playback
+    # ------------------------------------------------------------------
 
     def _tick_log(self, task: Task) -> Task:
-        try: line = next(self.lines)
-        except StopIteration: return Task.done
-
-        if m := R_ALIVE.match(line):
-            pl = self._ensure_player(m.group(1)); pl.target += STEP_DIST
-        elif m := R_WIN.match(line):
-            pl = self._ensure_player(m.group(1)); pl.target += STEP_DIST
-            pl.winner = True; pl.model.set_color(Vec4(1,0.84,0,1)); self._sparkle(pl)
-            print(f"🏆 {m.group(1)} a gagné !")
+        try:
+            line = next(self._log_lines)
+        except StopIteration:
             return Task.done
 
-        task.delayTime = self.tick_dt
+        if match := R_ALIVE.match(line):
+            name = match.group(1)
+            player = self._ensure_player(name)
+            player.target += STEP_DIST
+        elif match := R_WIN.match(line):
+            name = match.group(1)
+            player = self._ensure_player(name)
+            player.target += STEP_DIST
+            player.model.set_color(Vec4(1, 0.84, 0, 1))  # gold 🏆
+            print(f"🏆  {name} a gagné !")
+            return Task.done
+
         return Task.again
 
-    # ── Speed control ───────────────────────────────────────────────
-    def _faster(self) -> None:
-        self.tick_dt = max(T_MIN, self.tick_dt / 2)
-        print(f"⏩ Cadence : {self.tick_dt:.2f} s / ligne")
+    # ------------------------------------------------------------------
+    # 🌟  Misc.
+    # ------------------------------------------------------------------
 
-    def _slower(self) -> None:
-        self.tick_dt = min(T_MAX, self.tick_dt * 2)
-        print(f"⏪ Cadence : {self.tick_dt:.2f} s / ligne")
+    @staticmethod
+    def _clean(lines: Iterable[str]) -> Iterator[str]:
+        """Return an iterator of non‑blank, stripped lines."""
+        return (l.strip() for l in lines if l.strip())
 
-# ─── Entry point ────────────────────────────────────────────────────
-def main() -> None:
+
+# ---------------------------------------------------------------------------
+# Entrypoint 🚪
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:  # noqa: D401
     if len(sys.argv) != 2:
-        sys.exit("Usage : python corewar_marble_particles_safe.py <log.txt>")
+        sys.exit("Usage: python corewar_marble_refactored.py <log.txt>")
+
     log_path = Path(sys.argv[1])
     if not log_path.is_file():
-        sys.exit(f"Fichier introuvable : {log_path}")
-    with log_path.open(encoding="utf-8") as fp:
+        sys.exit(f"Fichier introuvable : {log_path}")
+
+    with log_path.open(encoding="utf‑8") as fp:
         CorewarMarble(fp.readlines()).run()
+
 
 if __name__ == "__main__":
     main()
